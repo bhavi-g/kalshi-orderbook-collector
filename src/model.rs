@@ -10,6 +10,16 @@ use engineering_challenge::Side;
 /// Fixed-point value, `1_000_000 = 1 unit`.
 pub type Fp = i64;
 
+/// How an exchange expresses a level update. Kalshi sends signed changes;
+/// Polymarket sends the new absolute size. The book applies either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Amount {
+    /// Add this signed change to the current level quantity.
+    Relative(Fp),
+    /// Set the level to this absolute quantity.
+    Absolute(Fp),
+}
+
 #[derive(Debug, Clone)]
 pub enum NormalizedEvent {
     /// Full book for one symbol (absolute quantities).
@@ -21,12 +31,12 @@ pub enum NormalizedEvent {
         recv_at: DateTime<Utc>,
         seq: u64,
     },
-    /// A signed change to one price level on one side.
+    /// An update to one price level on one side (relative or absolute).
     Delta {
         symbol: String,
         side: Side,
         price_level: Fp,
-        change: Fp,
+        amount: Amount,
         exch_ts: DateTime<Utc>,
         recv_at: DateTime<Utc>,
         seq: u64,

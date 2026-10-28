@@ -100,10 +100,12 @@ impl ExchangeCodec for KalshiCodec {
         ])
     }
 
-    async fn list_symbols(&self) -> Result<Vec<String>> {
+    async fn list_symbols(&self, limit: Option<usize>) -> Result<Vec<String>> {
         let mut all: Vec<String> = Vec::new();
         let mut cursor = String::new();
-        for _page in 0..40 {
+        // Page through the open-markets listing (bounded by a safety cap), stopping
+        // early once we have `limit` regular markets.
+        for _page in 0..200 {
             let headers = self.auth_headers("GET", MARKETS_PATH)?;
             let mut url = format!("{}{}?limit=1000&status=open", self.rest_base, MARKETS_PATH);
             if !cursor.is_empty() {
@@ -119,9 +121,10 @@ impl ExchangeCodec for KalshiCodec {
             anyhow::ensure!(status.is_success(), "markets failed: {status}");
             let (tickers, next) = parse_market_tickers(&body);
             all.extend(tickers);
-            // Stop early once we have plenty of regular markets (caller caps).
-            if filter_regular(all.clone()).len() >= 3000 {
-                break;
+            if let Some(limit) = limit {
+                if filter_regular(all.clone()).len() >= limit {
+                    break;
+                }
             }
             match next {
                 Some(c) => cursor = c,
@@ -200,7 +203,7 @@ impl ExchangeCodec for KalshiCodec {
                     symbol,
                     side,
                     price_level,
-                    change,
+                    amount: crate::model::Amount::Relative(change),
                     exch_ts,
                     recv_at,
                     seq,
@@ -283,10 +286,10 @@ mod tests {
         let raw = r#"{"type":"orderbook_delta","sid":1,"seq":9,"msg":{"market_ticker":"KXT","price_dollars":"0.5900","delta_fp":"-1.00","side":"no","ts_ms":1793164664481},"sending_ts_ms":1793164664487}"#;
         let evs = codec.decode(raw, Utc::now()).unwrap();
         match &evs[0] {
-            NormalizedEvent::Delta { side, price_level, change, .. } => {
+            NormalizedEvent::Delta { side, price_level, amount, .. } => {
                 assert_eq!(*side, Side::Sell);
                 assert_eq!(*price_level, 410_000); // 1 - 0.59
-                assert_eq!(*change, -1_000_000);
+                assert_eq!(*amount, crate::model::Amount::Relative(-1_000_000));
             }
             _ => panic!("expected delta"),
         }

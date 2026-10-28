@@ -3,6 +3,7 @@
 //! new adapter and nothing more.
 
 pub mod kalshi;
+pub mod polymarket;
 
 use chrono::{DateTime, Utc};
 
@@ -16,8 +17,9 @@ pub trait ExchangeCodec: Send + Sync + 'static {
     fn ws_path(&self) -> &str;
     /// Auth headers for a request of `method` to `path` (key, value) pairs.
     fn auth_headers(&self, method: &str, path: &str) -> anyhow::Result<Vec<(String, String)>>;
-    /// Discover the current universe of regular (tradeable) symbols.
-    async fn list_symbols(&self) -> anyhow::Result<Vec<String>>;
+    /// Discover regular (tradeable) symbols. `limit` stops discovery early once
+    /// that many are found; `None` means discover the entire universe.
+    async fn list_symbols(&self, limit: Option<usize>) -> anyhow::Result<Vec<String>>;
     /// Initial subscription frame for `markets` on a fresh connection.
     fn subscribe_frame(&self, id: u64, markets: &[String]) -> String;
     /// Frame to add markets to an existing subscription `sid`.

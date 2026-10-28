@@ -19,19 +19,32 @@ cargo run --release > capture.sbe 2> run.log
 # ... let it run, then Ctrl-C for a clean, flushed shutdown
 ```
 
+By default it subscribes to **all** regular (non-MVE) markets. Kalshi currently
+lists ~10k regular markets (amid ~200k auto-generated MVE markets), so a full run
+opens many sockets and discovery takes a few minutes; set `MAX_MARKETS` to bound
+it for a quick run.
+
+The **same binary** runs against **Polymarket** — it's the only thing that
+changes:
+
+```bash
+EXCHANGE=polymarket cargo run --release > capture.sbe 2> run.log   # no API key needed
+```
+
 Tuning (env vars, all optional):
 
 | var | default | meaning |
 |-----|---------|---------|
-| `MAX_MARKETS` | 40 | cap on regular markets subscribed (for a friendly live run) |
-| `PER_CONN` | 20 | markets per WebSocket connection |
+| `EXCHANGE` | `kalshi` | `kalshi` or `polymarket` |
+| `MAX_MARKETS` | 0 | cap on markets subscribed; **0 = unlimited (all)** |
+| `PER_CONN` | 150 | markets per WebSocket connection |
 | `REDUNDANCY` | 2 | connections per market (1 primary + N-1 backups) |
 | `SNAPSHOT_SECS` | 60 | full-snapshot cadence |
 | `DISCOVERY_SECS` | 60 | how often to re-scan for new/closed markets |
 | `STALL_SECS` | 15 | no-message timeout before switching source |
 | `QUIET_SECS` | 45 | per-symbol silence before resubscribe |
 | `RECYCLE_SECS` | 600 | whole-socket recycle interval |
-| `KALSHI_ENV` | prod | set to `demo` for the demo environment |
+| `KALSHI_ENV` | prod | set to `demo` for the demo environment (Kalshi only) |
 
 ## Output format
 
@@ -74,14 +87,18 @@ quantity.
 ```
 
 The only exchange-specific code is the `ExchangeCodec` adapter; everything else
-is generic (a Polymarket adapter would be a drop-in).
+is generic. **Two adapters ship** — Kalshi and Polymarket — and they exercise
+genuinely different exchange models: Kalshi sends signed *change* deltas with a
+per-connection sequence; Polymarket sends *absolute* level sizes with none. The
+`NormalizedEvent::Delta` carries an `Amount::{Relative,Absolute}` so the shared
+book handles both.
 
 | module | responsibility |
 |--------|----------------|
 | `fixedpoint.rs` | decimal-string ↔ fixed-point |
 | `model.rs` | normalized events |
 | `book.rs` | in-memory order book (delta → absolute) |
-| `codec/` | `ExchangeCodec` trait + Kalshi adapter |
+| `codec/` | `ExchangeCodec` trait + Kalshi and Polymarket adapters |
 | `lifecycle.rs` | symbol discovery parse + add/remove diff |
 | `monitor.rs` | per-connection seq-gap + per-symbol rate tracking |
 | `manager_logic.rs` | connection sharding + source selection |
@@ -98,7 +115,7 @@ is generic (a Polymarket adapter would be a drop-in).
 - **Clean SIGINT shutdown + flush** — `main.rs`, `output::spawn_writer`
 - **Ext 1 Redundant sockets** — primary+backup per market, seq-gap/stall detection, source switch + fresh snapshot (`collector`)
 - **Ext 2 Subscription monitoring** — per-symbol quiet detection + resubscribe, periodic whole-socket recycle (`collector`, `monitor`)
-- **Ext 3 Generic core** — `ExchangeCodec` is the only seam (`codec`)
+- **Ext 3 Generic core** — `ExchangeCodec` is the only seam; **Kalshi and Polymarket** adapters both ship and run on the same core (`codec/kalshi.rs`, `codec/polymarket.rs`)
 - **Ext 4 Latency** — `docs/latency.md` (measured receive-time spread across connections)
 
 ## Tests

@@ -38,9 +38,10 @@ impl CollectorConfig {
             std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
         };
         Self {
-            per_conn: num("PER_CONN", 20) as usize,
+            per_conn: num("PER_CONN", 150) as usize,
             redundancy: num("REDUNDANCY", 2) as usize,
-            max_markets: num("MAX_MARKETS", 40) as usize,
+            // 0 = unlimited: subscribe to every regular market.
+            max_markets: num("MAX_MARKETS", 0) as usize,
             discovery_interval: Duration::from_secs(num("DISCOVERY_SECS", 60)),
             snapshot_interval: Duration::from_secs(num("SNAPSHOT_SECS", 60)),
             stall_timeout: Duration::from_secs(num("STALL_SECS", 15)),
@@ -141,7 +142,7 @@ impl<C: ExchangeCodec> Collector<C> {
                 }
             }
             NormalizedEvent::Delta {
-                symbol, side, price_level, change, exch_ts, recv_at, seq,
+                symbol, side, price_level, amount, exch_ts, recv_at, seq,
             } => {
                 self.last_activity.insert((conn, symbol.clone()), now);
                 let status = self.seq.entry(conn).or_insert_with(SeqTracker::new).check(seq);
@@ -149,7 +150,7 @@ impl<C: ExchangeCodec> Collector<C> {
                     .books
                     .entry((conn, symbol.clone()))
                     .or_insert_with(OrderBook::new)
-                    .apply_delta(side, price_level, change);
+                    .apply(side, price_level, amount);
                 let is_source = self.source.get(&symbol) == Some(&conn);
                 if is_source {
                     let upd = build_update(&symbol, side, price_level, abs, exch_ts, recv_at);
@@ -234,7 +235,8 @@ impl<C: ExchangeCodec> Collector<C> {
     }
 
     async fn run_discovery(&mut self) {
-        let listed = match self.codec.list_symbols().await {
+        let limit = (self.cfg.max_markets > 0).then_some(self.cfg.max_markets);
+        let listed = match self.codec.list_symbols(limit).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[collector] discovery failed: {e:#}");
@@ -244,9 +246,14 @@ impl<C: ExchangeCodec> Collector<C> {
         let listed_set: HashSet<String> = listed.iter().cloned().collect();
         let current: HashSet<String> = self.symbol_group.keys().cloned().collect();
         // Stable target: keep still-open current symbols, fill remaining capacity with new.
+        let cap = if self.cfg.max_markets == 0 {
+            usize::MAX
+        } else {
+            self.cfg.max_markets
+        };
         let mut target: Vec<String> = current.intersection(&listed_set).cloned().collect();
         for s in &listed {
-            if target.len() >= self.cfg.max_markets {
+            if target.len() >= cap {
                 break;
             }
             if !current.contains(s) {
@@ -303,15 +310,24 @@ pub async fn run_collector<C: ExchangeCodec>(
     out: mpsc::Sender<OutMsg>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    // 1. Discover and cap symbols.
-    let mut symbols = codec.list_symbols().await?;
-    symbols.truncate(cfg.max_markets);
+    // 1. Discover symbols (cap only if max_markets > 0).
+    let limit = (cfg.max_markets > 0).then_some(cfg.max_markets);
+    let mut symbols = codec.list_symbols(limit).await?;
+    if cfg.max_markets > 0 {
+        symbols.truncate(cfg.max_markets);
+    }
     anyhow::ensure!(!symbols.is_empty(), "no regular symbols discovered");
     eprintln!("[collector] starting with {} symbols", symbols.len());
 
     // 2. Shard into groups; each group gets `redundancy` connections.
     let groups = shard(&symbols, cfg.per_conn);
-    let (event_tx, mut event_rx) = mpsc::channel::<(usize, NormalizedEvent)>(50_000);
+    eprintln!(
+        "[collector] {} groups x {} redundancy = {} connections",
+        groups.len(),
+        cfg.redundancy.max(1),
+        groups.len() * cfg.redundancy.max(1)
+    );
+    let (event_tx, mut event_rx) = mpsc::channel::<(usize, NormalizedEvent)>(200_000);
 
     let mut cmd_txs = Vec::new();
     let mut conn_group = Vec::new();
@@ -339,6 +355,8 @@ pub async fn run_collector<C: ExchangeCodec>(
                 cmd_rx,
                 shutdown.clone(),
             );
+            // Stagger handshakes so we don't open many sockets in one instant.
+            tokio::time::sleep(Duration::from_millis(40)).await;
         }
         // first replica is the initial source for every symbol in the group
         for s in group {

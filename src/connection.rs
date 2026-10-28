@@ -117,13 +117,13 @@ async fn run_once<C: ExchangeCodec>(
                         for s in &m { if !markets.contains(s) { markets.push(s.clone()); } }
                         next_cmd_id += 1;
                         let frame = codec.update_add_frame(next_cmd_id, sid, &m);
-                        let _ = ws.send(Message::Text(frame)).await;
+                        if !frame.is_empty() { let _ = ws.send(Message::Text(frame)).await; }
                     }
                     Some(ConnCmd::RemoveMarkets(m)) => {
                         markets.retain(|s| !m.contains(s));
                         next_cmd_id += 1;
                         let frame = codec.update_remove_frame(next_cmd_id, sid, &m);
-                        let _ = ws.send(Message::Text(frame)).await;
+                        if !frame.is_empty() { let _ = ws.send(Message::Text(frame)).await; }
                     }
                     None => { /* collector gone */ return Ok(RunExit::Shutdown); }
                 }
@@ -131,14 +131,20 @@ async fn run_once<C: ExchangeCodec>(
             msg = ws.next() => {
                 match msg {
                     Some(Ok(Message::Text(t))) => {
-                        let events = codec.decode(&t, Utc::now())?;
-                        for ev in events {
-                            if let NormalizedEvent::SubscribeAck { sid: s } = &ev {
-                                sid = *s;
+                        // A single malformed/control text frame (e.g. a "PONG")
+                        // must not tear down the socket — skip it, never fatal.
+                        match codec.decode(&t, Utc::now()) {
+                            Ok(events) => {
+                                for ev in events {
+                                    if let NormalizedEvent::SubscribeAck { sid: s } = &ev {
+                                        sid = *s;
+                                    }
+                                    if tx.send((id, ev)).await.is_err() {
+                                        return Ok(RunExit::Shutdown);
+                                    }
+                                }
                             }
-                            if tx.send((id, ev)).await.is_err() {
-                                return Ok(RunExit::Shutdown);
-                            }
+                            Err(_) => {}
                         }
                     }
                     Some(Ok(Message::Ping(p))) => { let _ = ws.send(Message::Pong(p)).await; }

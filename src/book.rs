@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use engineering_challenge::Side;
 
-use crate::model::Fp;
+use crate::model::{Amount, Fp};
 
 /// A single market's two-sided book, each side a `price_level -> abs_qty` map.
 #[derive(Default)]
@@ -35,6 +35,15 @@ impl OrderBook {
         }
     }
 
+    /// Apply a relative or absolute update at a level; return the resulting
+    /// absolute quantity (clamped at 0). A result of 0 removes the level.
+    pub fn apply(&mut self, side: Side, price: Fp, amount: Amount) -> Fp {
+        match amount {
+            Amount::Relative(change) => self.apply_delta(side, price, change),
+            Amount::Absolute(qty) => self.set_level(side, price, qty),
+        }
+    }
+
     /// Apply a signed change at a level; return the resulting absolute quantity
     /// (clamped at 0). A result of 0 removes the level.
     pub fn apply_delta(&mut self, side: Side, price: Fp, change: Fp) -> Fp {
@@ -50,6 +59,21 @@ impl OrderBook {
             map.insert(price, next);
         }
         next
+    }
+
+    /// Set a level to an absolute quantity; 0 removes it. Returns the quantity.
+    pub fn set_level(&mut self, side: Side, price: Fp, qty: Fp) -> Fp {
+        let map = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        let qty = qty.max(0);
+        if qty == 0 {
+            map.remove(&price);
+        } else {
+            map.insert(price, qty);
+        }
+        qty
     }
 
     /// Current levels, each side ascending by price.
@@ -92,6 +116,16 @@ mod tests {
     fn negative_result_clamps_to_zero() {
         let mut b = OrderBook::new();
         assert_eq!(b.apply_delta(Side::Buy, 100, -5_000_000), 0);
+    }
+
+    #[test]
+    fn absolute_set_overrides_and_deletes() {
+        let mut b = OrderBook::new();
+        assert_eq!(b.apply(Side::Buy, 100, Amount::Absolute(5_000_000)), 5_000_000);
+        assert_eq!(b.apply(Side::Buy, 100, Amount::Absolute(2_000_000)), 2_000_000);
+        assert_eq!(b.apply(Side::Buy, 100, Amount::Absolute(0)), 0);
+        let (bids, _) = b.levels();
+        assert!(bids.is_empty());
     }
 
     #[test]
