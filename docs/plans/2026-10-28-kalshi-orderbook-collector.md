@@ -1,6 +1,6 @@
 # Kalshi Order-Book Collector Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A Rust service that maintains a live order book for every regular (non-MVE) Kalshi market and streams complete, time-accurate SBE snapshots + deltas to stdout.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024; `tokio`, `tokio-tungstenite` (rustls), `reqwest` (rustls), `ed25519-dalek`, `serde_json`, `chrono`, `anyhow`; the template's SBE helpers (`AlignedSbeWriter`, `AlignedSbeReader`, `SnapshotDomain`, `PriceLevelUpdateDomain`, `Side`).
 
-**Spec:** `docs/superpowers/specs/2026-10-28-kalshi-orderbook-collector-design.md`
+**Spec:** `docs/specs/2026-10-28-kalshi-orderbook-collector-design.md`
 
 ## Global Constraints
 

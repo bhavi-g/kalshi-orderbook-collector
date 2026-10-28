@@ -131,5 +131,9 @@ present).
 
 ## Design & plan
 
-See `docs/superpowers/specs/` (design) and `docs/superpowers/plans/`
-(implementation plan).
+- **`docs/PROJECT_WRITEUP.md`** — the full narrative: every major decision,
+  the trade-offs considered, what the live spikes revealed, and why the
+  architecture looks the way it does. Start here for the "why."
+- `docs/latency.md` — Extension 4 findings.
+- `docs/specs/` (design doc) and `docs/plans/` (implementation plan) — the
+  formal spec and task breakdown this was built from.
