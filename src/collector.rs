@@ -126,8 +126,11 @@ impl<C: ExchangeCodec> Collector<C> {
         let now = Instant::now();
         self.last_msg.insert(conn, now);
         match ev {
-            NormalizedEvent::Snapshot { symbol, bids, asks, exch_ts, recv_at, .. } => {
+            NormalizedEvent::Snapshot { symbol, bids, asks, exch_ts, recv_at, seq } => {
                 self.last_activity.insert((conn, symbol.clone()), now);
+                // Snapshot and deltas share one per-connection seq stream; seed the
+                // tracker so the first following delta is continuous.
+                self.seq.entry(conn).or_insert_with(SeqTracker::new).check(seq);
                 self.books
                     .entry((conn, symbol.clone()))
                     .or_insert_with(OrderBook::new)
@@ -138,10 +141,10 @@ impl<C: ExchangeCodec> Collector<C> {
                 }
             }
             NormalizedEvent::Delta {
-                symbol, side, price_level, change, exch_ts, recv_at, seq, ..
+                symbol, side, price_level, change, exch_ts, recv_at, seq,
             } => {
                 self.last_activity.insert((conn, symbol.clone()), now);
-                let status = self.seq.entry(conn).or_default().check(seq);
+                let status = self.seq.entry(conn).or_insert_with(SeqTracker::new).check(seq);
                 let abs = self
                     .books
                     .entry((conn, symbol.clone()))
@@ -195,8 +198,11 @@ impl<C: ExchangeCodec> Collector<C> {
             if conn_age > self.cfg.stall_timeout {
                 self.switch_source(&symbol, Some(src), "stall");
             } else if act_age > self.cfg.quiet_timeout {
-                // resubscribe this symbol on its source to repair it, and
-                // switch output to a fresher carrier meanwhile.
+                // Ext 2: the subscription has gone quiet (low data-points/sec on
+                // an otherwise-live socket). Resubscribe this symbol on its source
+                // to repair it, and switch output to a fresher carrier meanwhile.
+                let rate = self.rate.rate_per_sec(&symbol, now);
+                eprintln!("[collector] quiet {symbol} (src rate {rate:.3}/s), resubscribing");
                 if let Some(tx) = self.cmd_txs.get(src) {
                     let _ = tx.try_send(ConnCmd::RemoveMarkets(vec![symbol.clone()]));
                     let _ = tx.try_send(ConnCmd::AddMarkets(vec![symbol.clone()]));

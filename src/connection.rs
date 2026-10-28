@@ -133,7 +133,7 @@ async fn run_once<C: ExchangeCodec>(
                     Some(Ok(Message::Text(t))) => {
                         let events = codec.decode(&t, Utc::now())?;
                         for ev in events {
-                            if let NormalizedEvent::SubscribeAck { sid: s, .. } = &ev {
+                            if let NormalizedEvent::SubscribeAck { sid: s } = &ev {
                                 sid = *s;
                             }
                             if tx.send((id, ev)).await.is_err() {

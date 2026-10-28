@@ -20,7 +20,6 @@ pub enum NormalizedEvent {
         exch_ts: DateTime<Utc>,
         recv_at: DateTime<Utc>,
         seq: u64,
-        sid: u64,
     },
     /// A signed change to one price level on one side.
     Delta {
@@ -31,10 +30,9 @@ pub enum NormalizedEvent {
         exch_ts: DateTime<Utc>,
         recv_at: DateTime<Utc>,
         seq: u64,
-        sid: u64,
     },
     /// Acknowledgement that a subscription is live (carries its server `sid`).
-    SubscribeAck { sid: u64, id: u64 },
+    SubscribeAck { sid: u64 },
     /// Anything we don't act on (heartbeats, errors, etc.).
     Other,
 }

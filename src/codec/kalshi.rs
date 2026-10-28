@@ -180,7 +180,6 @@ impl ExchangeCodec for KalshiCodec {
                     exch_ts,
                     recv_at,
                     seq,
-                    sid,
                 }])
             }
             "orderbook_delta" => {
@@ -205,13 +204,11 @@ impl ExchangeCodec for KalshiCodec {
                     exch_ts,
                     recv_at,
                     seq,
-                    sid,
                 }])
             }
             "subscribed" => {
                 let sub_sid = v["msg"]["sid"].as_u64().unwrap_or(sid);
-                let id = v["id"].as_u64().unwrap_or(0);
-                Ok(vec![NormalizedEvent::SubscribeAck { sid: sub_sid, id }])
+                Ok(vec![NormalizedEvent::SubscribeAck { sid: sub_sid }])
             }
             _ => Ok(vec![NormalizedEvent::Other]),
         }
