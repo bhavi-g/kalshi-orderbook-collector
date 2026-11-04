@@ -57,6 +57,17 @@ pub fn should_resync(status: SeqStatus, is_source: bool) -> bool {
     is_source && matches!(status, SeqStatus::Gap { .. })
 }
 
+/// Whether enough time has passed since the last quiet-market action on this
+/// symbol to take another one. Without this cooldown, switching a quiet
+/// symbol to its backup connection can immediately be judged quiet again on
+/// the very next health-check tick (the backup's own last-activity timestamp
+/// is typically just as stale, since it was subscribed from the start too),
+/// causing the two connections to ping-pong every few seconds instead of
+/// respecting `quiet_timeout`.
+pub fn quiet_action_allowed(last: Option<Instant>, now: Instant, quiet_timeout: Duration) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= quiet_timeout)
+}
+
 struct Collector<C: ExchangeCodec> {
     codec: Arc<C>,
     cfg: CollectorConfig,
@@ -71,6 +82,14 @@ struct Collector<C: ExchangeCodec> {
     source: HashMap<String, usize>,
     last_msg: HashMap<usize, Instant>,
     last_activity: HashMap<(usize, String), Instant>,
+    /// Last time we took quiet-market action (resubscribe + source switch) for
+    /// each symbol. Prevents re-triggering faster than `quiet_timeout`: a
+    /// backup connection subscribed from startup typically has its own
+    /// equally-stale `last_activity` for the symbol, so without this cooldown
+    /// the next health-check tick (every few seconds) would see it as still
+    /// quiet and switch straight back, ping-ponging forever instead of
+    /// respecting the intended cadence.
+    last_quiet_action: HashMap<String, Instant>,
     rate: RateTracker,
     recycle_cursor: usize,
 }
@@ -93,18 +112,30 @@ impl<C: ExchangeCodec> Collector<C> {
             .collect()
     }
 
-    fn emit_snapshot_from(&mut self, conn: usize, symbol: &str) {
-        if let Some(book) = self.books.get(&(conn, symbol.to_string())) {
-            let (bids, asks) = book.levels();
-            let now = Utc::now();
-            let snap = build_snapshot(symbol, &bids, &asks, now, now);
-            let _ = self.out.try_send(OutMsg::Snapshot(snap));
+    /// Send a built message to the output writer, blocking (applying
+    /// backpressure) until there's room rather than silently discarding it.
+    /// The only legitimate send failure here is the writer having shut down
+    /// (e.g. during process exit), which we log loudly instead of pretending
+    /// the message went out.
+    async fn emit(&mut self, msg: OutMsg) {
+        if self.out.send(msg).await.is_err() {
+            eprintln!("[collector] output writer is gone; message could not be emitted");
         }
+    }
+
+    async fn emit_snapshot_from(&mut self, conn: usize, symbol: &str) {
+        let Some(book) = self.books.get(&(conn, symbol.to_string())) else {
+            return;
+        };
+        let (bids, asks) = book.levels();
+        let now = Utc::now();
+        let snap = build_snapshot(symbol, &bids, &asks, now, now);
+        self.emit(OutMsg::Snapshot(snap)).await;
     }
 
     /// Switch a symbol's output source to the healthiest other carrier and emit
     /// a fresh snapshot from it. Returns true if the source changed.
-    fn switch_source(&mut self, symbol: &str, avoid: Option<usize>, reason: &str) -> bool {
+    async fn switch_source(&mut self, symbol: &str, avoid: Option<usize>, reason: &str) -> bool {
         let Some(&gi) = self.symbol_group.get(symbol) else {
             return false;
         };
@@ -119,11 +150,11 @@ impl<C: ExchangeCodec> Collector<C> {
         }
         eprintln!("[collector] switch source {symbol} -> conn {new_src} ({reason})");
         self.source.insert(symbol.to_string(), new_src);
-        self.emit_snapshot_from(new_src, symbol);
+        self.emit_snapshot_from(new_src, symbol).await;
         true
     }
 
-    fn handle_event(&mut self, conn: usize, ev: NormalizedEvent) {
+    async fn handle_event(&mut self, conn: usize, ev: NormalizedEvent) {
         let now = Instant::now();
         self.last_msg.insert(conn, now);
         match ev {
@@ -138,7 +169,7 @@ impl<C: ExchangeCodec> Collector<C> {
                     .apply_snapshot(&bids, &asks);
                 if self.source.get(&symbol) == Some(&conn) {
                     let snap = build_snapshot(&symbol, &bids, &asks, exch_ts, recv_at);
-                    let _ = self.out.try_send(OutMsg::Snapshot(snap));
+                    self.emit(OutMsg::Snapshot(snap)).await;
                 }
             }
             NormalizedEvent::Delta {
@@ -154,14 +185,14 @@ impl<C: ExchangeCodec> Collector<C> {
                 let is_source = self.source.get(&symbol) == Some(&conn);
                 if is_source {
                     let upd = build_update(&symbol, side, price_level, abs, exch_ts, recv_at);
-                    let _ = self.out.try_send(OutMsg::Delta(upd));
+                    self.emit(OutMsg::Delta(upd)).await;
                     self.rate.record(&symbol, now);
                 }
                 if should_resync(status, is_source) {
                     if let SeqStatus::Gap { missing } = status {
                         eprintln!("[collector] seq gap {missing} on source conn {conn} for {symbol}");
                     }
-                    if self.switch_source(&symbol, Some(conn), "seq gap") {
+                    if self.switch_source(&symbol, Some(conn), "seq gap").await {
                         // repair the gapped connection's books with a reconnect
                         if let Some(tx) = self.cmd_txs.get(conn) {
                             let _ = tx.try_send(ConnCmd::Reconnect);
@@ -173,19 +204,20 @@ impl<C: ExchangeCodec> Collector<C> {
         }
     }
 
-    fn emit_minute_snapshots(&mut self) {
+    async fn emit_minute_snapshots(&mut self) {
         let symbols: Vec<(String, usize)> = self
             .source
             .iter()
             .map(|(s, &c)| (s.clone(), c))
             .collect();
+        let count = symbols.len();
         for (symbol, conn) in symbols {
-            self.emit_snapshot_from(conn, &symbol);
+            self.emit_snapshot_from(conn, &symbol).await;
         }
-        eprintln!("[collector] emitted minute snapshots for {} symbols", self.source.len());
+        eprintln!("[collector] emitted minute snapshots for {count} symbols");
     }
 
-    fn health_check(&mut self) {
+    async fn health_check(&mut self) {
         let now = Instant::now();
         let symbols: Vec<String> = self.source.keys().cloned().collect();
         for symbol in symbols {
@@ -197,25 +229,34 @@ impl<C: ExchangeCodec> Collector<C> {
                 *self.last_activity.get(&(src, symbol.clone())).unwrap_or(&now),
             );
             if conn_age > self.cfg.stall_timeout {
-                self.switch_source(&symbol, Some(src), "stall");
+                self.switch_source(&symbol, Some(src), "stall").await;
             } else if act_age > self.cfg.quiet_timeout {
                 // Ext 2: the subscription has gone quiet (low data-points/sec on
-                // an otherwise-live socket). Resubscribe this symbol on its source
-                // to repair it, and switch output to a fresher carrier meanwhile.
+                // an otherwise-live socket). Don't re-trigger faster than
+                // quiet_timeout for the same symbol — see last_quiet_action's
+                // doc comment for why the naive per-connection check alone
+                // isn't enough.
+                let last = self.last_quiet_action.get(&symbol).copied();
+                if !quiet_action_allowed(last, now, self.cfg.quiet_timeout) {
+                    continue;
+                }
+                // Resubscribe this symbol on its source to repair it, and
+                // switch output to a fresher carrier meanwhile.
                 let rate = self.rate.rate_per_sec(&symbol, now);
                 eprintln!("[collector] quiet {symbol} (src rate {rate:.3}/s), resubscribing");
+                self.last_quiet_action.insert(symbol.clone(), now);
                 if let Some(tx) = self.cmd_txs.get(src) {
                     let _ = tx.try_send(ConnCmd::RemoveMarkets(vec![symbol.clone()]));
                     let _ = tx.try_send(ConnCmd::AddMarkets(vec![symbol.clone()]));
                 }
-                self.switch_source(&symbol, Some(src), "quiet");
+                self.switch_source(&symbol, Some(src), "quiet").await;
             }
         }
     }
 
     /// Recycle one whole socket (Ext 2): move its sourced symbols to backups,
     /// then force it to reconnect and resubscribe fresh.
-    fn recycle_next(&mut self) {
+    async fn recycle_next(&mut self) {
         if self.cmd_txs.is_empty() {
             return;
         }
@@ -225,7 +266,7 @@ impl<C: ExchangeCodec> Collector<C> {
         let symbols: Vec<String> = self.group_symbols[gi].iter().cloned().collect();
         for symbol in symbols {
             if self.source.get(&symbol) == Some(&conn) {
-                self.switch_source(&symbol, Some(conn), "recycle");
+                self.switch_source(&symbol, Some(conn), "recycle").await;
             }
         }
         eprintln!("[collector] recycling conn {conn}");
@@ -380,6 +421,7 @@ pub async fn run_collector<C: ExchangeCodec>(
         seq: HashMap::new(),
         last_msg: HashMap::new(),
         last_activity: HashMap::new(),
+        last_quiet_action: HashMap::new(),
         rate: RateTracker::new(Duration::from_secs(10)),
         recycle_cursor: 0,
     };
@@ -400,10 +442,10 @@ pub async fn run_collector<C: ExchangeCodec>(
                 eprintln!("[collector] shutting down");
                 break;
             }
-            Some((conn, ev)) = event_rx.recv() => collector.handle_event(conn, ev),
-            _ = snap_t.tick() => collector.emit_minute_snapshots(),
-            _ = health_t.tick() => collector.health_check(),
-            _ = recycle_t.tick() => collector.recycle_next(),
+            Some((conn, ev)) = event_rx.recv() => collector.handle_event(conn, ev).await,
+            _ = snap_t.tick() => collector.emit_minute_snapshots().await,
+            _ = health_t.tick() => collector.health_check().await,
+            _ = recycle_t.tick() => collector.recycle_next().await,
             _ = disc_t.tick() => collector.run_discovery().await,
         }
     }
@@ -413,6 +455,9 @@ pub async fn run_collector<C: ExchangeCodec>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::polymarket::PolymarketCodec;
+    use crate::model::Amount;
+    use engineering_challenge::Side;
 
     #[test]
     fn resync_on_gap_from_source() {
@@ -425,5 +470,124 @@ mod tests {
     #[test]
     fn no_resync_from_nonsource() {
         assert!(!should_resync(SeqStatus::Gap { missing: 9 }, false));
+    }
+
+    #[test]
+    fn quiet_action_allowed_first_time() {
+        assert!(quiet_action_allowed(None, Instant::now(), Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn quiet_action_blocked_within_cooldown() {
+        // Regression test: observed live as a symbol flagged "quiet" 4 times
+        // in 110 seconds (expected at most ~2 at a 45s quiet_timeout) — the
+        // health-check tick (every few seconds) must not be allowed to
+        // re-trigger quiet handling before quiet_timeout has actually elapsed.
+        let t0 = Instant::now();
+        let three_seconds_later = t0 + Duration::from_secs(3); // one health_check tick
+        assert!(
+            !quiet_action_allowed(Some(t0), three_seconds_later, Duration::from_secs(45)),
+            "must not re-trigger before quiet_timeout elapses"
+        );
+    }
+
+    #[test]
+    fn quiet_action_allowed_after_cooldown_elapses() {
+        let t0 = Instant::now();
+        let after_timeout = t0 + Duration::from_secs(46);
+        assert!(quiet_action_allowed(Some(t0), after_timeout, Duration::from_secs(45)));
+    }
+
+    fn dummy_cfg() -> CollectorConfig {
+        CollectorConfig {
+            per_conn: 1,
+            redundancy: 1,
+            max_markets: 1,
+            discovery_interval: Duration::from_secs(3600),
+            snapshot_interval: Duration::from_secs(3600),
+            stall_timeout: Duration::from_secs(3600),
+            quiet_timeout: Duration::from_secs(3600),
+            health_interval: Duration::from_secs(3600),
+            socket_recycle_interval: Duration::from_secs(3600),
+        }
+    }
+
+    fn dummy_delta(seq: u64) -> NormalizedEvent {
+        NormalizedEvent::Delta {
+            symbol: "SYM".to_string(),
+            side: Side::Buy,
+            price_level: 100,
+            amount: Amount::Relative(1),
+            exch_ts: Utc::now(),
+            recv_at: Utc::now(),
+            seq,
+        }
+    }
+
+    /// Root-cause regression test: every delta emitted for the source
+    /// connection must reach the output channel, even when the writer is
+    /// momentarily slower than production. No event may be silently dropped
+    /// just because the output channel is temporarily full.
+    #[tokio::test]
+    async fn delta_emission_never_drops_under_backpressure() {
+        const N: usize = 50;
+        let codec = Arc::new(PolymarketCodec::new().unwrap());
+        let (out_tx, mut out_rx) = mpsc::channel::<OutMsg>(1); // tiny: forces backpressure
+        let mut source = HashMap::new();
+        source.insert("SYM".to_string(), 0usize);
+
+        let mut collector = Collector {
+            codec,
+            cfg: dummy_cfg(),
+            out: out_tx,
+            cmd_txs: Vec::new(),
+            conn_group: Vec::new(),
+            group_conns: Vec::new(),
+            group_symbols: Vec::new(),
+            symbol_group: HashMap::new(),
+            books: HashMap::new(),
+            seq: HashMap::new(),
+            source,
+            last_msg: HashMap::new(),
+            last_activity: HashMap::new(),
+            last_quiet_action: HashMap::new(),
+            rate: RateTracker::new(Duration::from_secs(10)),
+            recycle_cursor: 0,
+        };
+
+        // Drain concurrently so a correctly-backpressured sender can make
+        // progress; a sender that silently drops on a full channel does not
+        // need this drainer to "succeed" at sending everything, which is
+        // exactly the bug this test catches.
+        let drain = tokio::spawn(async move {
+            let mut count = 0usize;
+            while count < N {
+                match out_rx.recv().await {
+                    Some(_) => count += 1,
+                    None => break,
+                }
+            }
+            count
+        });
+
+        for i in 1..=N {
+            collector.handle_event(0, dummy_delta(i as u64)).await;
+        }
+        drop(collector);
+
+        // The channel closes once `collector` (and its sole Sender) is dropped,
+        // so the drain task always terminates on its own — no hang is possible
+        // either way; the timeout is just a safety net.
+        let received = tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("drain task hung unexpectedly")
+            .unwrap();
+        assert_eq!(
+            received, N,
+            "every emitted delta must reach the output channel; {} of {N} were silently lost \
+             (this is the exact defect reported as \"market syncing bugs that prevented it from \
+             capturing properly\" — see src/collector.rs try_send call sites)",
+            N - received
+        );
     }
 }

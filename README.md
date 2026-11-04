@@ -135,5 +135,9 @@ present).
   the trade-offs considered, what the live spikes revealed, and why the
   architecture looks the way it does. Start here for the "why."
 - `docs/latency.md` — Extension 4 findings.
+- `docs/POSTMORTEM.md` — a data-loss bug found post-submission (silent drop
+  under output backpressure, plus a related quiet-market detection issue
+  found while stress-verifying the fix), root-caused, fixed, and
+  re-verified live.
 - `docs/specs/` (design doc) and `docs/plans/` (implementation plan) — the
   formal spec and task breakdown this was built from.
